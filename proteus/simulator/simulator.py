@@ -132,6 +132,7 @@ class Channels:
             self._channel[dev_id]['feature'].put(task)
         elif task.is_cross_stage:
             # TBD: modify cross stage comm to adapt to more general cases
+            print(f"cross stage comm {task.volume}")
             task.wait_n = 1
             if self._channel[task.src]['feature'].empty():
                 task.wait_n -= 1
@@ -836,6 +837,8 @@ class Simulator:
         self.strategy_tree = strategy_tree
         self._cost_model = OpCostModel()
         self.flexflow = False #FlexFlow
+        
+        self.amount_cross_stage = 0
 
         self.executors = {}
         for dev_id in range(self.strategy_tree.dev_topo.ndevs):
@@ -1168,6 +1171,38 @@ class Simulator:
                     heapq.heappush(ready_queue, (ntsk.ready[cur_task.state], ntsk.id, ntsk))
         self.iter_speed = max(list(devices.values()))
 
+    # def print_stats(self):
+    #     if self.flexflow:
+    #         print()
+    #         print('Iter Speed: {:.4f}ms/iter'.format(self.iter_speed))
+    #         return
+
+    #     print()
+    #     print(
+    #         'Iter Speed: {:.4f}ms/iter, Compile time: {:.4f}s, Run time: {:.4f}s'
+    #         .format(self.iter_speed, self.compile_time, self.run_time))
+    #     print('Compile time:')
+    #     print('{}Task create: {:.4f}s'.format(' ' * 4, self.task_create_time))
+    #     print('{}Dep analysis: {:.4f}s'.format(' ' * 4,
+    #                                            self.dep_analysis_time))
+
+    #     comm, other = 0, 0
+    #     for i in range(Task.total_tasks()):
+    #         if isinstance(Task.get(i), CommTask):
+    #             comm += 1
+    #         else:
+    #             other += 1
+    #     print('{}Comm Tasks: {}, Other Tasks: {}'.format(' ' * 4, comm, other))
+
+    #     max_memory, dev_id = 0, -1
+    #     for i, executor in self.executors.items():
+    #         if executor.max_mem_alloc > max_memory:
+    #             max_memory = executor.max_mem_alloc
+    #             dev_id = i
+    #     print('Max memory alloc: {:.3f}MB on device {}'.format(
+    #         max_memory, dev_id))
+    #     print()
+
     def print_stats(self):
         if self.flexflow:
             print()
@@ -1175,27 +1210,69 @@ class Simulator:
             return
 
         print()
-        print(
-            'Iter Speed: {:.4f}ms/iter, Compile time: {:.4f}s, Run time: {:.4f}s'
-            .format(self.iter_speed, self.compile_time, self.run_time))
+        print('Iter Speed: {:.4f}ms/iter, Compile time: {:.4f}s, Run time: {:.4f}s'
+              .format(self.iter_speed, self.compile_time, self.run_time))
         print('Compile time:')
         print('{}Task create: {:.4f}s'.format(' ' * 4, self.task_create_time))
-        print('{}Dep analysis: {:.4f}s'.format(' ' * 4,
-                                               self.dep_analysis_time))
+        print('{}Dep analysis: {:.4f}s'.format(' ' * 4, self.dep_analysis_time))
+        
+        cross_comm = 0
+        
+        grad_comm = 0
+        
+        total_comm = 0
 
+        # 기존 통신 태스크 개수 및 기타 태스크 집계
         comm, other = 0, 0
         for i in range(Task.total_tasks()):
-            if isinstance(Task.get(i), CommTask):
+            t = Task.get(i)
+            if isinstance(t, CommTask):
+                if t.is_grad_comm:
+                    grad_comm += t.volume
+                if t.is_cross_stage:
+                    cross_comm += t.volume
+                    comm += 1
                 comm += 1
+                total_comm += t.volume
             else:
                 other += 1
         print('{}Comm Tasks: {}, Other Tasks: {}'.format(' ' * 4, comm, other))
+        
+        print('{}Cross stage comm: {:.4f}MB'.format(' ' * 4, cross_comm))
+        print('{}Grad comm: {:.4f}MB'.format(' ' * 4, grad_comm))
+        print('{}Total comm: {:.4f}MB'.format(' ' * 4, total_comm))
+        
+        # 각 레이어별로 계산 및 통신 비용을 집계
+        from collections import defaultdict
+        layer_comm = defaultdict(float)
+        layer_comp = defaultdict(float)
+        
+        total_tasks = Task.total_tasks()
+        for i in range(total_tasks):
+            t = Task.get(i)
+            # 태스크의 실행 비용: 이미 t.cost에 저장되어 있다고 가정합니다.
+            cost = t.cost if hasattr(t, 'cost') else 0
+            # 태스크 이름에서 첫 번째 '_' 앞부분을 레이어 이름으로 사용 (없으면 전체 이름 사용)
+            if '_' in t.name:
+                layer = t.name.split('_')[0]
+            else:
+                layer = t.name
+            if isinstance(t, CommTask):
+                layer_comm[layer] += cost
+            else:
+                layer_comp[layer] += cost
 
+        print("Per-layer costs:")
+        layers = set(list(layer_comm.keys()) + list(layer_comp.keys()))
+        for layer in sorted(layers):
+            print("  Layer {}: comp cost: {:.4f}, comm cost: {:.4f}".format(
+                layer, layer_comp[layer], layer_comm[layer]))
+        
+        # 최대 메모리 사용량 출력
         max_memory, dev_id = 0, -1
         for i, executor in self.executors.items():
             if executor.max_mem_alloc > max_memory:
                 max_memory = executor.max_mem_alloc
                 dev_id = i
-        print('Max memory alloc: {:.3f}MB on device {}'.format(
-            max_memory, dev_id))
+        print('Max memory alloc: {:.3f}MB on device {}'.format(max_memory, dev_id))
         print()
